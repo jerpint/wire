@@ -93,8 +93,16 @@ Worth knowing before you build on it. None of these are hidden.
 - **Modal detection is a screen-text heuristic.** It catches the trust dialogs
   claude and codex ship today. A TUI can always invent a new one, which is why
   wire reports the block rather than trying to answer it.
-- **`--env` passes your environment to a child process.** That hands it every
-  credential you hold. Name what you need when that matters.
+- **Spawning passes your environment to the child, which also passes your
+  identity.** Anything that decides who it is from an environment variable — and
+  agent tooling often does — will believe the child is you. This is not
+  hypothetical: a spawned agent here inherited the spawner's identity variables
+  and sent its replies attributed to the spawner. It also hands the child every
+  credential you hold. `--no-inherit-env` withholds your environment, but does
+  not give a clean one — the tmux server passes its own environment to every
+  pane it creates, and that belongs to whoever started the server. The choice is
+  between your environment and the server's, not between one and none. Name what
+  you need with `--env` either way.
 
 ## Using it as a library
 
