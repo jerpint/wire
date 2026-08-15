@@ -86,14 +86,26 @@ your own session. You don't have to watch for it — you'll be told. Checking
 repeatedly costs you attention and usually finds nothing.
 
 **Ask for an ack when the cost of a silent failure is high.** Add something like
-"reply immediately to confirm you've started" to the seed prompt. An agent that
-never acks failed in a way you'd otherwise discover much later — it never
-started, it's sitting on a permission prompt, or it died at boot.
+"reply immediately to confirm you've started" to the seed prompt. It is cheap
+and it catches the worst case: an agent that never started, is sitting on a
+permission prompt, or died at boot.
 
-**Then set yourself a reminder and go do other work.** If the ack arrives,
-there's nothing to do. If your reminder fires and you still haven't heard
-anything, *now* read the pane — deliberately, once. That read is worth doing
-precisely because you already know something is off.
+But be clear about what an ack is worth. It proves the message arrived and the
+agent could reply — nothing more. An agent that acked can still stall, or work
+confidently in the wrong direction. And an agent may simply ignore the request
+and start working, which happens often enough that a missing ack is not evidence
+of failure. Treat silence as a reason to look, not as a verdict.
+
+**If — and only if — you have a durable way to schedule one, set yourself a
+reminder and go do other work.** A background timer, a scheduled wake-up,
+something that will actually fire. If you have no such mechanism, do not tell
+yourself you will check later: you will not, and a promise to your future self
+is worse than no plan, because it feels like one. Without a timer, either do the
+work of waiting deliberately or hand the task over with clear completion
+criteria and let the reply find you.
+
+When the reminder fires, read the pane only if you have heard nothing at all.
+If the agent has been talking to you, keep waiting.
 
 **Pick the interval from the cost of a wrong direction, not the length of the
 task.** A well-specified, isolated fix needs no check even if it runs long. A
@@ -107,7 +119,15 @@ trajectory has scrolled away. For progress, ask the agent for a checkpoint — i
 can summarise what it actually did, where the screen only shows the most recent
 thing it happened to print.
 
-So: read for liveness, ask for progress, and do neither unless you have a reason.
+**Finishing is not the same as succeeding — check the work.** A report of "done"
+is a claim, not a result. Before you act on it, look at what actually changed:
+read the diff, open the artifacts, run the tests or the build. This is the step
+most easily skipped, and the one that catches an agent that did something
+plausible and wrong. Say what "done" means in the seed prompt, so the agent
+knows what it is aiming at and you know what to verify against.
+
+So: read for liveness, ask for progress, verify before you accept — and do none
+of it reflexively.
 
 ## See what an agent is doing
 
