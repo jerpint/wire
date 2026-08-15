@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""wire — let CLI coding agents talk to each other.
+
+One file. Standard library only. No config, no daemon, no registry.
+
+tmux is the database: tmux sessions are the address book, and a walk of each
+pane's process tree says which sessions are live agents and which harness each
+one runs. wire therefore ADOPTS agents you started by hand — it never asks to
+be the thing that launches them.
+
+Usable three ways:
+  - as a binary   : put this file on PATH, `wire list`
+  - as a library  : `from wire import send, agents, spawn`
+  - as a skill    : SKILL.md next to this file teaches an agent the verbs
+
+Verbs:
+  wire list                      which agents are running, and on what
+  wire send <target> "message"   deliver a message, with a return address
+  wire spawn <harness> "seed"    start an agent and brief it
+  wire read <target> [-n LINES]  read what an agent currently shows
+
+THE ENVELOPE — the one design rule that matters:
+  A delivered message NEVER contains a runnable command. It carries a plain
+  `reply-to` address as data; the receiving agent learns the reply verb from
+  the skill, not from the message body. Embedding a literal command invites an
+  auto-approving agent to execute the message instead of reading it — which we
+  have watched happen for real.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+__version__ = "0.1.0"
+
+TMUX_TIMEOUT = 10
+_PREFIX = "wire"
+
+
+# ---------------------------------------------------------------------------
+# Harness table — everything that describes an AGENT lives here and nowhere
+# else. Adding a harness should be adding one entry.
+#
+# Every quirk below was found the hard way against a live TUI. They are not
+# theoretical.
+# ---------------------------------------------------------------------------
+
+HARNESSES = {
+    "claude": {
+        "label": "Claude Code",
+        "binary": "claude",
+        # comm names that mean "the agent is running" in a process tree
+        "process_names": {"claude"},
+        # Claude's TUI is paste-aware: a \n inside a paste is a literal newline,
+        # so a trailing Enter must be a SEPARATE keystroke. It accepts that
+        # Enter immediately.
+        "paste_settle": 0.0,
+        # Paste-aware TUIs render multi-line pastes correctly.
+        "flatten_paste_newlines": False,
+        "leading_slash_opens_palette": False,
+        "skill_invoke": "/{name}",
+        "yolo_flag": "--dangerously-skip-permissions",
+        "model_flag": "--model",
+    },
+    "codex": {
+        "label": "Codex",
+        "binary": "codex",
+        "process_names": {"codex"},
+        # Codex folds an Enter arriving right after a paste INTO the paste — the
+        # message strands in the composer. It needs a settle before Enter.
+        "paste_settle": 0.5,
+        "flatten_paste_newlines": False,
+        "leading_slash_opens_palette": False,
+        # Codex's native mention feature; `$name` only ever worked by the model
+        # choosing to read the file itself.
+        "skill_invoke": "@{name}",
+        "yolo_flag": "--dangerously-bypass-approvals-and-sandbox",
+        "model_flag": "-m",
+    },
+    "opencode": {
+        "label": "opencode",
+        "binary": "opencode",
+        "process_names": {"opencode"},
+        "paste_settle": 0.3,
+        # opencode's TUI is NOT paste-aware — it DROPS newlines from a pasted
+        # message entirely, joining lines with no separator at all. Flattening
+        # to spaces is what keeps word boundaries alive.
+        "flatten_paste_newlines": True,
+        # A message starting with "/" opens opencode's command palette and never
+        # submits ("No matching items"). A leading space makes it a literal
+        # message, and opencode still resolves the skill natively.
+        "leading_slash_opens_palette": True,
+        "skill_invoke": "/{name}",
+        "yolo_flag": "--auto",
+        "model_flag": "--model",
+    },
+}
+
+def harness_names() -> list[str]:
+    return list(HARNESSES)
+
+
+def get_harness(name: str) -> dict:
+    try:
+        return HARNESSES[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown harness {name!r}; known: {', '.join(HARNESSES)}"
+        ) from None
+
+
+# ---------------------------------------------------------------------------
+# tmux + process discovery
+# ---------------------------------------------------------------------------
+
+class WireError(Exception):
+    """Anything wire can't do — missing tmux, dead target, unknown harness."""
+
+
+def _run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=check, timeout=TMUX_TIMEOUT
+        )
+    except FileNotFoundError:
+        raise WireError(f"{cmd[0]} not found on PATH") from None
+    except subprocess.TimeoutExpired:
+        raise WireError(f"{cmd[0]} timed out after {TMUX_TIMEOUT}s") from None
+
+
+def tmux_sessions() -> list[str]:
+    """Every live tmux session name."""
+    try:
+        out = _run(["tmux", "list-sessions", "-F", "#{session_name}"]).stdout
+    except WireError:
+        raise
+    except subprocess.CalledProcessError:
+        return []  # no server running == no sessions
+    return [s for s in out.strip().split("\n") if s]
+
+
+def _process_table() -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Return (pid -> [child pids], pid -> comm).
+
+    Portable across GNU/procps and BSD/macOS ps. BSD has no --no-headers and
+    reports `comm` as a full path, so the header is dropped by hand and the
+    basename taken. This matters: wire is meant to run on a laptop, and that
+    laptop is often a Mac.
+    """
+    proc = subprocess.run(
+        ["ps", "-eo", "pid,ppid,comm"], capture_output=True, text=True
+    )
+    children: dict[str, list[str]] = {}
+    comms: dict[str, str] = {}
+    for line in proc.stdout.strip().split("\n"):
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, ppid, comm = parts
+        if not pid.isdigit() or not ppid.isdigit():
+            continue  # the header row
+        children.setdefault(ppid, []).append(pid)
+        comms[pid] = os.path.basename(comm.strip())
+    return children, comms
+
+
+def _pane_pids(session: str) -> list[str]:
+    try:
+        out = _run(["tmux", "list-panes", "-t", session, "-F", "#{pane_pid}"]).stdout
+    except subprocess.CalledProcessError:
+        return []
+    return [p for p in out.strip().split("\n") if p]
+
+
+def detect_harness(session: str) -> str | None:
+    """Which harness is running in this tmux session, if any.
+
+    Walks the FULL subtree under each pane pid, not just direct children — the
+    real tree is pane(bash) -> wrapper -> agent, so checking direct children
+    alone always misses it.
+    """
+    pane_pids = _pane_pids(session)
+    if not pane_pids:
+        return None
+    children, comms = _process_table()
+    by_comm = {}
+    for name, entry in HARNESSES.items():
+        for pname in entry["process_names"]:
+            by_comm[pname] = name
+
+    queue = list(pane_pids)
+    seen: set[str] = set()
+    while queue:
+        cur = queue.pop()
+        if cur in seen:
+            continue
+        seen.add(cur)
+        found = by_comm.get(comms.get(cur, ""))
+        if found:
+            return found
+        queue.extend(children.get(cur, []))
+    return None
+
+
+def agents() -> list[dict]:
+    """Every tmux session that is running a known agent.
+
+    This is the whole address book. No state file is consulted, which is why
+    wire works on sessions it never launched.
+    """
+    out = []
+    for name in tmux_sessions():
+        harness = detect_harness(name)
+        if harness:
+            out.append({"session": name, "harness": harness,
+                        "label": HARNESSES[harness]["label"]})
+    return out
+
+
+def resolve(target: str) -> dict:
+    """Resolve a target to an agent record.
+
+    Accepts an exact tmux session name, or a unique prefix of one.
+    """
+    found = agents()
+    exact = [a for a in found if a["session"] == target]
+    if exact:
+        return exact[0]
+    partial = [a for a in found if a["session"].startswith(target)]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        names = ", ".join(a["session"] for a in partial)
+        raise WireError(f"{target!r} is ambiguous: {names}")
+    if not found:
+        raise WireError("no agents running. `wire list` to check.")
+    names = ", ".join(a["session"] for a in found)
+    raise WireError(f"no agent named {target!r}. running: {names}")
+
+
+# ---------------------------------------------------------------------------
+# The envelope
+# ---------------------------------------------------------------------------
+
+def whoami() -> str:
+    """This agent's own address, if it is running inside one.
+
+    WIRE_FROM lets a caller override. Otherwise the enclosing tmux session name
+    is the honest answer.
+    """
+    override = os.environ.get("WIRE_FROM")
+    if override:
+        return override
+    if os.environ.get("TMUX"):
+        try:
+            return _run(["tmux", "display-message", "-p", "#{session_name}"]).stdout.strip()
+        except (WireError, subprocess.CalledProcessError):
+            pass
+    return ""
+
+
+def format_envelope(text: str, from_addr: str = "") -> str:
+    """Wrap a message with a return address.
+
+    Deliberately contains NO runnable command. `reply-to` is an address, and
+    the skill teaches the verb. An agent running with auto-approved shell access
+    will happily execute a message that looks like a command — so the message
+    must not look like one.
+    """
+    if not from_addr:
+        return text
+    return (
+        f"[{_PREFIX} message]\n"
+        f"from: {from_addr}\n"
+        f"reply-to: {from_addr}\n"
+        f"---\n"
+        f"{text}"
+    )
+
+
+def _guard(text: str, harness: str) -> str:
+    """Apply per-harness paste quirks to outgoing text."""
+    entry = get_harness(harness)
+    if entry["flatten_paste_newlines"]:
+        # opencode drops newlines outright; flattening to " | " keeps the
+        # envelope readable instead of jamming words together.
+        text = re.sub(r"\n+", " | ", text)
+    if entry["leading_slash_opens_palette"] and text.startswith("/"):
+        # A leading slash strands the message in the command palette. A leading
+        # space makes it a literal message, and the skill still resolves.
+        text = " " + text
+    return text
+
+
+# ---------------------------------------------------------------------------
+# Transport
+# ---------------------------------------------------------------------------
+
+def paste(session: str, text: str, harness: str) -> None:
+    """Deliver text into a running agent's TUI and submit it.
+
+    set-buffer + paste-buffer rather than send-keys -l: send-keys sends each
+    character as its own keystroke and backs up the pane input buffer on long
+    messages. A buffer paste lands atomically, exactly like a human paste.
+
+    Enter is a separate keystroke afterwards, because paste-aware TUIs treat a
+    \\n inside a paste as a literal newline rather than submit.
+    """
+    entry = get_harness(harness)
+    buf = f"{_PREFIX}-{session}"
+    # Scrolling a pane with the mouse silently enters copy-mode, where a paste
+    # is visible but never reaches the process and Enter is eaten as a copy-mode
+    # command. Cancelling first is a harmless no-op when not in a mode.
+    _run(["tmux", "send-keys", "-t", session, "-X", "cancel"], check=False)
+    _run(["tmux", "set-buffer", "-b", buf, text])
+    _run(["tmux", "paste-buffer", "-b", buf, "-d", "-t", session])
+    settle = entry["paste_settle"]
+    if settle:
+        time.sleep(settle)
+    _run(["tmux", "send-keys", "-t", session, "Enter"])
+
+
+def send(target: str, message: str, from_addr: str | None = None) -> dict:
+    """Deliver a message to an agent, with a return address.
+
+    The library entry point. Returns the resolved target.
+    """
+    agent = resolve(target)
+    sender = whoami() if from_addr is None else from_addr
+    body = format_envelope(message, sender)
+    paste(agent["session"], _guard(body, agent["harness"]), agent["harness"])
+    return agent
+
+
+def read(target: str, lines: int = 40) -> str:
+    """Capture what an agent's pane currently shows."""
+    agent = resolve(target)
+    out = _run([
+        "tmux", "capture-pane", "-p", "-t", agent["session"], "-S", f"-{lines}",
+    ]).stdout
+    return out.rstrip()
+
+
+# ---------------------------------------------------------------------------
+# Spawn
+# ---------------------------------------------------------------------------
+
+def build_command(harness: str, model: str = "", yolo: bool = False) -> str:
+    """The command line that starts this harness.
+
+    Standalone this is genuinely simple: the binary off PATH, running as
+    whoever is already logged in. No wrappers, no per-agent HOME, no credential
+    seeding — all of that is a multi-tenant platform's problem, not this tool's.
+    """
+    entry = get_harness(harness)
+    parts = [entry["binary"]]
+    if yolo:
+        parts.append(entry["yolo_flag"])
+    if model:
+        parts += [entry["model_flag"], model]
+    return " ".join(shlex.quote(p) if " " in p else p for p in parts)
+
+
+def wait_ready(session: str, harness: str, timeout: float = 60.0) -> bool:
+    """Wait until the agent process is actually up in this session.
+
+    Polling for the PROCESS rather than for a banner string is harness-agnostic
+    and does not rot when a TUI redesigns its footer.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if detect_harness(session) == harness:
+            return True
+        time.sleep(0.4)
+    return False
+
+
+def spawn(harness: str, seed: str = "", name: str = "", model: str = "",
+          yolo: bool = False, cwd: str = "") -> dict:
+    """Start an agent in a new detached tmux session and optionally brief it.
+
+    The seed prompt is pasted after the TUI is up rather than passed on the
+    command line: some harnesses dispatch a CLI prompt before they have finished
+    resolving their model, which silently sends the message to the wrong one.
+    Pasting after boot sidesteps that for every harness at once.
+    """
+    entry = get_harness(harness)
+    session = name or f"{harness}-{os.urandom(3).hex()}"
+    if session in tmux_sessions():
+        raise WireError(f"tmux session {session!r} already exists")
+
+    cmd = build_command(harness, model=model, yolo=yolo)
+    tmux_cmd = ["tmux", "new-session", "-d", "-s", session]
+    if cwd:
+        tmux_cmd += ["-c", cwd]
+    tmux_cmd.append(cmd)
+    try:
+        _run(tmux_cmd)
+    except subprocess.CalledProcessError as e:
+        raise WireError(f"could not start tmux session: {e.stderr.strip()}") from None
+
+    result = {"session": session, "harness": harness,
+              "label": entry["label"], "briefed": False}
+    if not seed:
+        return result
+    if not wait_ready(session, harness):
+        raise WireError(
+            f"session {session!r} started but no {harness} process appeared. "
+            f"`tmux attach -t {session}` to see what happened."
+        )
+    time.sleep(1.0)  # let the TUI paint before pasting into it
+    body = format_envelope(seed, whoami())
+    paste(session, _guard(body, harness), harness)
+    result["briefed"] = True
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _cmd_list(args) -> int:
+    found = agents()
+    if args.json:
+        print(json.dumps(found, indent=2))
+        return 0
+    if not found:
+        print("no agents running.")
+        return 0
+    width = max(len(a["session"]) for a in found)
+    for a in found:
+        print(f"{a['session']:<{width}}  {a['label']}")
+    return 0
+
+
+def _cmd_send(args) -> int:
+    agent = send(args.target, args.message, from_addr=args.from_addr)
+    print(f"delivered → {agent['session']} ({agent['label']})")
+    return 0
+
+
+def _cmd_spawn(args) -> int:
+    result = spawn(args.harness, seed=args.seed, name=args.name,
+                   model=args.model, yolo=args.yolo, cwd=args.cwd)
+    print(f"SESSION={result['session']}")
+    print(f"ATTACH=tmux attach -t {result['session']}")
+    if args.seed and not result["briefed"]:
+        print("warning: started but not briefed", file=sys.stderr)
+    return 0
+
+
+def _cmd_read(args) -> int:
+    print(read(args.target, lines=args.lines))
+    return 0
+
+
+def _cmd_whoami(args) -> int:
+    me = whoami()
+    print(me if me else "(not inside a tmux session)")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog=_PREFIX,
+        description="Let CLI coding agents talk to each other.",
+    )
+    p.add_argument("--version", action="version", version=f"{_PREFIX} {__version__}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    lst = sub.add_parser("list", help="which agents are running")
+    lst.add_argument("--json", action="store_true")
+    lst.set_defaults(func=_cmd_list)
+
+    snd = sub.add_parser("send", help="deliver a message to an agent")
+    snd.add_argument("target", help="tmux session name, or a unique prefix")
+    snd.add_argument("message")
+    snd.add_argument("--from", dest="from_addr", default=None,
+                     help="return address (default: your own tmux session)")
+    snd.set_defaults(func=_cmd_send)
+
+    spw = sub.add_parser("spawn", help="start an agent and brief it")
+    spw.add_argument("harness", choices=harness_names())
+    spw.add_argument("seed", nargs="?", default="")
+    spw.add_argument("--name", default="", help="tmux session name")
+    spw.add_argument("--model", default="")
+    spw.add_argument("--cwd", default="", help="working directory")
+    spw.add_argument("--yolo", action="store_true",
+                     help="skip the agent's own permission prompts")
+    spw.set_defaults(func=_cmd_spawn)
+
+    rd = sub.add_parser("read", help="read what an agent currently shows")
+    rd.add_argument("target")
+    rd.add_argument("-n", "--lines", type=int, default=40)
+    rd.set_defaults(func=_cmd_read)
+
+    who = sub.add_parser("whoami", help="your own address")
+    who.set_defaults(func=_cmd_whoami)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except WireError as e:
+        print(f"{_PREFIX}: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
