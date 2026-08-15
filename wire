@@ -171,10 +171,17 @@ def _process_table() -> tuple[dict[str, list[str]], dict[str, str]]:
 
 
 def _panes(session: str) -> list[tuple[str, str]]:
-    """[(pane_id, pane_pid)] for a session. pane_id looks like "%12"."""
+    """[(pane_id, pane_pid)] for EVERY pane in a session. pane_id looks like "%12".
+
+    -s makes this session-wide. Without it tmux lists only the selected
+    window's panes, so an agent sitting in any other window is invisible —
+    and which agent you can see would depend on which window happens to be
+    selected at the time.
+    """
     try:
         out = _run([
-            "tmux", "list-panes", "-t", session, "-F", "#{pane_id} #{pane_pid}",
+            "tmux", "list-panes", "-s", "-t", session,
+            "-F", "#{pane_id} #{pane_pid}",
         ]).stdout
     except subprocess.CalledProcessError:
         return []
@@ -186,8 +193,42 @@ def _panes(session: str) -> list[tuple[str, str]]:
     return panes
 
 
+def find_agents(session: str) -> list[tuple[str, str]]:
+    """Every (harness, pane_id) running an agent in this session.
+
+    A session can hold more than one — panes and windows are free, and people
+    put a second agent next to the first. Returning all of them keeps that
+    honest; picking the first would make the address silently mean whichever
+    tmux happened to list earliest.
+    """
+    panes = _panes(session)
+    if not panes:
+        return []
+    children, comms = _process_table()
+    by_comm = {}
+    for name, entry in HARNESSES.items():
+        for pname in entry["process_names"]:
+            by_comm[pname] = name
+
+    found = []
+    for pane_id, pane_pid in panes:
+        queue = [pane_pid]
+        seen: set[str] = set()
+        while queue:
+            cur = queue.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            hit = by_comm.get(comms.get(cur, ""))
+            if hit:
+                found.append((hit, pane_id))
+                break
+            queue.extend(children.get(cur, []))
+    return found
+
+
 def find_agent(session: str) -> tuple[str, str] | None:
-    """(harness, pane_id) for the agent in this session, or None.
+    """(harness, pane_id) for the FIRST agent in this session, or None.
 
     Returning the PANE and not just the session matters. A session can hold
     several panes, and `tmux -t <session>` resolves to whichever pane is
@@ -200,28 +241,8 @@ def find_agent(session: str) -> tuple[str, str] | None:
     real tree is pane(bash) -> wrapper -> agent, so checking direct children
     alone always misses it.
     """
-    panes = _panes(session)
-    if not panes:
-        return None
-    children, comms = _process_table()
-    by_comm = {}
-    for name, entry in HARNESSES.items():
-        for pname in entry["process_names"]:
-            by_comm[pname] = name
-
-    for pane_id, pane_pid in panes:
-        queue = [pane_pid]
-        seen: set[str] = set()
-        while queue:
-            cur = queue.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            found = by_comm.get(comms.get(cur, ""))
-            if found:
-                return found, pane_id
-            queue.extend(children.get(cur, []))
-    return None
+    found = find_agents(session)
+    return found[0] if found else None
 
 
 def detect_harness(session: str) -> str | None:
@@ -238,11 +259,13 @@ def agents() -> list[dict]:
     """
     out = []
     for name in tmux_sessions():
-        hit = find_agent(name)
-        if hit:
-            harness, pane = hit
+        found = find_agents(name)
+        for harness, pane in found:
             out.append({"session": name, "harness": harness, "pane": pane,
-                        "label": HARNESSES[harness]["label"]})
+                        "label": HARNESSES[harness]["label"],
+                        # True when this session holds more than one agent, so
+                        # the session name alone is not a usable address.
+                        "shared_session": len(found) > 1})
     return out
 
 
@@ -252,14 +275,27 @@ def resolve(target: str) -> dict:
     Accepts an exact tmux session name, or a unique prefix of one.
     """
     found = agents()
+    # A pane id is always an exact address, and it is the way out of the
+    # ambiguity below.
+    if target.startswith("%"):
+        by_pane = [a for a in found if a["pane"] == target]
+        if by_pane:
+            return by_pane[0]
+        raise WireError(f"no agent in pane {target}")
     exact = [a for a in found if a["session"] == target]
-    if exact:
+    if len(exact) == 1:
         return exact[0]
+    if len(exact) > 1:
+        panes = ", ".join(f"{a['pane']} ({a['harness']})" for a in exact)
+        raise WireError(
+            f"session {target!r} holds {len(exact)} agents — address one by "
+            f"pane: {panes}"
+        )
     partial = [a for a in found if a["session"].startswith(target)]
     if len(partial) == 1:
         return partial[0]
     if len(partial) > 1:
-        names = ", ".join(a["session"] for a in partial)
+        names = ", ".join(f"{a['session']} {a['pane']}" for a in partial)
         raise WireError(f"{target!r} is ambiguous: {names}")
     if not found:
         raise WireError("no agents running. `wire list` to check.")
@@ -570,7 +606,9 @@ def _cmd_list(args) -> int:
         return 0
     width = max(len(a["session"]) for a in found)
     for a in found:
-        print(f"{a['session']:<{width}}  {a['label']}")
+        # Only show the pane when the session name is not enough to address it.
+        suffix = f" {a['pane']}" if a.get("shared_session") else ""
+        print(f"{a['session']:<{width}}{suffix}  {a['label']}")
     return 0
 
 

@@ -56,9 +56,14 @@ Both are handled, and both are worth knowing about.
 server keeps whatever environment it was started with, possibly hours ago and
 possibly as a different user — so a spawned agent can end up with the wrong
 `HOME` and come up logged out, or miss the API key sitting right there in your
-shell. `wire spawn` passes your environment through explicitly (via `tmux -e`,
-so secrets stay out of the process table). Add or override with
-`--env KEY=VALUE`.
+shell. `wire spawn` passes your environment through explicitly, via `tmux -e`.
+Add or override with `--env KEY=VALUE`.
+
+Two caveats rather than a promise: those values land in the tmux client's argv,
+so they are briefly visible to anyone running `ps` during the call — a shorter
+exposure than an `env` prefix, which would keep them visible for the agent's
+whole life, but not zero. And passing your environment wholesale hands the
+child every credential you hold.
 
 **An agent can be running and still not ready for input.** Claude asks whether
 you trust a folder the first time it runs in one, and codex has its own version.
