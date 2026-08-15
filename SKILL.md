@@ -103,7 +103,7 @@ A few things worth knowing:
 ## Using it from Python
 
 ```python
-import wire
+import wire   # requires wire.py on your path — see the README
 
 wire.agents()                      # [{'session': ..., 'harness': ...}, ...]
 wire.send("worker-a11f3c", "hi")

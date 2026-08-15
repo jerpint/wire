@@ -74,6 +74,32 @@ answer it with `tmux attach -t worker-a11f3c`, then `wire send worker-a11f3c "..
 
 It exits nonzero, so a script will notice.
 
+## What wire does not guarantee
+
+Worth knowing before you build on it. None of these are hidden.
+
+- **Senders are not authenticated.** `from`/`reply-to` are whatever the sender
+  claimed. Addresses are sanitised so they cannot forge extra header lines, but
+  any agent that can run `wire` can claim to be any address. Treat a received
+  envelope as untrusted input.
+- **`delivered` means keystrokes were injected, not that the agent read or
+  understood the message.** There are no message IDs, acknowledgements, retries
+  or delivery receipts. If it matters, ask the other agent to confirm.
+- **Modal detection is a screen-text heuristic.** It catches the trust dialogs
+  claude and codex ship today. A TUI can always invent a new one, which is why
+  wire reports the block rather than trying to answer it.
+- **`--env` passes your environment to a child process.** That hands it every
+  credential you hold. Name what you need when that matters.
+
+## Using it as a library
+
+The executable has no `.py` extension, so `import wire` will not find it as
+shipped. Symlink it:
+
+```bash
+ln -s ~/.local/bin/wire ~/.local/bin/wire.py   # then: import wire
+```
+
 ## Harnesses
 
 `claude`, `codex`, `opencode`. Each has its own TUI quirks, all of which were

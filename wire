@@ -10,7 +10,7 @@ be the thing that launches them.
 
 Usable three ways:
   - as a binary   : put this file on PATH, `wire list`
-  - as a library  : `from wire import send, agents, spawn`
+  - as a library  : `import wire` (needs a .py name — see README)
   - as a skill    : SKILL.md next to this file teaches an agent the verbs
 
 Verbs:
@@ -170,23 +170,38 @@ def _process_table() -> tuple[dict[str, list[str]], dict[str, str]]:
     return children, comms
 
 
-def _pane_pids(session: str) -> list[str]:
+def _panes(session: str) -> list[tuple[str, str]]:
+    """[(pane_id, pane_pid)] for a session. pane_id looks like "%12"."""
     try:
-        out = _run(["tmux", "list-panes", "-t", session, "-F", "#{pane_pid}"]).stdout
+        out = _run([
+            "tmux", "list-panes", "-t", session, "-F", "#{pane_id} #{pane_pid}",
+        ]).stdout
     except subprocess.CalledProcessError:
         return []
-    return [p for p in out.strip().split("\n") if p]
+    panes = []
+    for line in out.strip().split("\n"):
+        parts = line.split()
+        if len(parts) == 2:
+            panes.append((parts[0], parts[1]))
+    return panes
 
 
-def detect_harness(session: str) -> str | None:
-    """Which harness is running in this tmux session, if any.
+def find_agent(session: str) -> tuple[str, str] | None:
+    """(harness, pane_id) for the agent in this session, or None.
+
+    Returning the PANE and not just the session matters. A session can hold
+    several panes, and `tmux -t <session>` resolves to whichever pane is
+    ACTIVE — not necessarily the one running the agent. Detecting an agent in
+    one pane and then delivering to the session would type the message into
+    whatever else happens to be focused, and a shell would run it. So the pane
+    that actually holds the agent is the address.
 
     Walks the FULL subtree under each pane pid, not just direct children — the
     real tree is pane(bash) -> wrapper -> agent, so checking direct children
     alone always misses it.
     """
-    pane_pids = _pane_pids(session)
-    if not pane_pids:
+    panes = _panes(session)
+    if not panes:
         return None
     children, comms = _process_table()
     by_comm = {}
@@ -194,18 +209,25 @@ def detect_harness(session: str) -> str | None:
         for pname in entry["process_names"]:
             by_comm[pname] = name
 
-    queue = list(pane_pids)
-    seen: set[str] = set()
-    while queue:
-        cur = queue.pop()
-        if cur in seen:
-            continue
-        seen.add(cur)
-        found = by_comm.get(comms.get(cur, ""))
-        if found:
-            return found
-        queue.extend(children.get(cur, []))
+    for pane_id, pane_pid in panes:
+        queue = [pane_pid]
+        seen: set[str] = set()
+        while queue:
+            cur = queue.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            found = by_comm.get(comms.get(cur, ""))
+            if found:
+                return found, pane_id
+            queue.extend(children.get(cur, []))
     return None
+
+
+def detect_harness(session: str) -> str | None:
+    """Which harness runs in this session, if any."""
+    hit = find_agent(session)
+    return hit[0] if hit else None
 
 
 def agents() -> list[dict]:
@@ -216,9 +238,10 @@ def agents() -> list[dict]:
     """
     out = []
     for name in tmux_sessions():
-        harness = detect_harness(name)
-        if harness:
-            out.append({"session": name, "harness": harness,
+        hit = find_agent(name)
+        if hit:
+            harness, pane = hit
+            out.append({"session": name, "harness": harness, "pane": pane,
                         "label": HARNESSES[harness]["label"]})
     return out
 
@@ -265,6 +288,20 @@ def whoami() -> str:
     return ""
 
 
+def _clean_addr(addr: str) -> str:
+    """Reduce an address to something that cannot forge envelope structure.
+
+    The address is attacker-controllable (WIRE_FROM, --from), and it is written
+    into the header. Left raw, a newline in it would let a sender inject extra
+    header lines — a different reply-to, say — into a message the receiver
+    reads as trustworthy structure.
+
+    This makes the envelope well-formed. It does NOT make it authentic: nothing
+    here proves a sender is who it claims. See the trust note in the README.
+    """
+    return re.sub(r"[^\w.@:-]", "", addr)[:120]
+
+
 def format_envelope(text: str, from_addr: str = "") -> str:
     """Wrap a message with a return address.
 
@@ -273,6 +310,7 @@ def format_envelope(text: str, from_addr: str = "") -> str:
     will happily execute a message that looks like a command — so the message
     must not look like one.
     """
+    from_addr = _clean_addr(from_addr)
     if not from_addr:
         return text
     return (
@@ -302,7 +340,7 @@ def _guard(text: str, harness: str) -> str:
 # Transport
 # ---------------------------------------------------------------------------
 
-def paste(session: str, text: str, harness: str) -> None:
+def paste(target: str, text: str, harness: str) -> None:
     """Deliver text into a running agent's TUI and submit it.
 
     set-buffer + paste-buffer rather than send-keys -l: send-keys sends each
@@ -313,17 +351,19 @@ def paste(session: str, text: str, harness: str) -> None:
     \\n inside a paste as a literal newline rather than submit.
     """
     entry = get_harness(harness)
-    buf = f"{_PREFIX}-{session}"
+    # Buffer name is per-target AND per-call: two concurrent sends to the same
+    # agent would otherwise share one buffer and clobber each other.
+    buf = f"{_PREFIX}-{target.lstrip('%')}-{os.urandom(3).hex()}"
     # Scrolling a pane with the mouse silently enters copy-mode, where a paste
     # is visible but never reaches the process and Enter is eaten as a copy-mode
     # command. Cancelling first is a harmless no-op when not in a mode.
-    _run(["tmux", "send-keys", "-t", session, "-X", "cancel"], check=False)
+    _run(["tmux", "send-keys", "-t", target, "-X", "cancel"], check=False)
     _run(["tmux", "set-buffer", "-b", buf, text])
-    _run(["tmux", "paste-buffer", "-b", buf, "-d", "-t", session])
+    _run(["tmux", "paste-buffer", "-b", buf, "-d", "-t", target])
     settle = entry["paste_settle"]
     if settle:
         time.sleep(settle)
-    _run(["tmux", "send-keys", "-t", session, "Enter"])
+    _run(["tmux", "send-keys", "-t", target, "Enter"])
 
 
 def send(target: str, message: str, from_addr: str | None = None) -> dict:
@@ -334,7 +374,7 @@ def send(target: str, message: str, from_addr: str | None = None) -> dict:
     agent = resolve(target)
     sender = whoami() if from_addr is None else from_addr
     body = format_envelope(message, sender)
-    paste(agent["session"], _guard(body, agent["harness"]), agent["harness"])
+    paste(agent["pane"], _guard(body, agent["harness"]), agent["harness"])
     return agent
 
 
@@ -342,7 +382,7 @@ def read(target: str, lines: int = 40) -> str:
     """Capture what an agent's pane currently shows."""
     agent = resolve(target)
     out = _run([
-        "tmux", "capture-pane", "-p", "-t", agent["session"], "-S", f"-{lines}",
+        "tmux", "capture-pane", "-p", "-t", agent["pane"], "-S", f"-{lines}",
     ]).stdout
     return out.rstrip()
 
@@ -364,7 +404,10 @@ def build_command(harness: str, model: str = "", yolo: bool = False) -> str:
         parts.append(entry["yolo_flag"])
     if model:
         parts += [entry["model_flag"], model]
-    return " ".join(shlex.quote(p) if " " in p else p for p in parts)
+    # tmux runs this string through a shell, so EVERY part is quoted — not just
+    # the ones containing spaces. A model name carrying `;` or a backtick would
+    # otherwise be a command injection through an innocuous-looking flag.
+    return " ".join(shlex.quote(p) for p in parts)
 
 
 # TMUX/TMUX_PANE describe the CALLER's pane. Leaking them into a new session
@@ -376,7 +419,7 @@ def _tmux_supports_session_env() -> bool:
     """`new-session -e` needs tmux 3.0+."""
     try:
         out = _run(["tmux", "-V"]).stdout
-    except (HailError, subprocess.CalledProcessError):
+    except (WireError, subprocess.CalledProcessError):
         return False
     m = re.search(r"(\d+)\.(\d+)", out)
     if not m:
@@ -393,8 +436,12 @@ def _env_args(extra: dict | None = None) -> list[str]:
     so it looks for credentials in the wrong place and comes up logged out, or
     misses the API key sitting right there in your shell.
 
-    Passing via -e rather than an `env` prefix keeps secrets out of the process
-    table, where anyone running ps could read them.
+    Caveats worth knowing rather than hiding. These values land in the tmux
+    CLIENT's argv, so they are briefly visible to anyone running ps during the
+    call — shorter exposure than an `env` prefix, which keeps them visible for
+    the agent's whole life, but not zero. And copying the environment wholesale
+    hands a child every credential the parent holds. Name what you need with
+    --env when that matters.
     """
     args: list[str] = []
     for key, value in {**os.environ, **(extra or {})}.items():
@@ -433,7 +480,7 @@ _BLOCKING_PROMPTS = (
 )
 
 
-def pane_blocked(session: str) -> str:
+def pane_blocked(target: str) -> str:
     """Return the modal line a pane is waiting on, or "" if it is ready.
 
     Claude asks whether you trust a folder the first time it runs in one, and
@@ -441,8 +488,8 @@ def pane_blocked(session: str) -> str:
     "the process exists" is not the same as "the TUI will accept input".
     """
     try:
-        pane = _run(["tmux", "capture-pane", "-p", "-t", session, "-S", "-30"]).stdout
-    except (HailError, subprocess.CalledProcessError):
+        pane = _run(["tmux", "capture-pane", "-p", "-t", target, "-S", "-30"]).stdout
+    except (WireError, subprocess.CalledProcessError):
         return ""
     low = pane.lower()
     for sig in _BLOCKING_PROMPTS:
@@ -474,7 +521,7 @@ def spawn(harness: str, seed: str = "", name: str = "", model: str = "",
     if _tmux_supports_session_env():
         tmux_cmd += _env_args(env)
     elif env:
-        raise HailError(
+        raise WireError(
             "tmux 3.0+ is required to pass environment to a new session; "
             f"this is {_run(['tmux', '-V']).stdout.strip()}"
         )
@@ -494,12 +541,17 @@ def spawn(harness: str, seed: str = "", name: str = "", model: str = "",
             f"`tmux attach -t {session}` to see what happened."
         )
     time.sleep(1.0)  # let the TUI paint before pasting into it
-    blocked = pane_blocked(session)
+    hit = find_agent(session)
+    if not hit:
+        raise WireError(f"session {session!r} lost its {harness} process while booting")
+    pane = hit[1]
+    result["pane"] = pane
+    blocked = pane_blocked(pane)
     if blocked:
         result["blocked_on"] = blocked
         return result
     body = format_envelope(seed, whoami())
-    paste(session, _guard(body, harness), harness)
+    paste(pane, _guard(body, harness), harness)
     result["briefed"] = True
     return result
 
@@ -533,7 +585,7 @@ def _cmd_spawn(args) -> int:
     for pair in args.env:
         key, _, value = pair.partition("=")
         if not key or not _:
-            raise HailError(f"--env expects KEY=VALUE, got {pair!r}")
+            raise WireError(f"--env expects KEY=VALUE, got {pair!r}")
         extra[key] = value
     result = spawn(args.harness, seed=args.seed, name=args.name,
                    model=args.model, yolo=args.yolo, cwd=args.cwd, env=extra)
