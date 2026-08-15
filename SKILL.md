@@ -92,9 +92,16 @@ permission prompt, or died at boot.
 
 But be clear about what an ack is worth. It proves the message arrived and the
 agent could reply — nothing more. An agent that acked can still stall, or work
-confidently in the wrong direction. And an agent may simply ignore the request
-and start working, which happens often enough that a missing ack is not evidence
-of failure. Treat silence as a reason to look, not as a verdict.
+confidently in the wrong direction. And silence has many causes besides death:
+it may be busy, or slow, or unable to reply the way you expected. Treat silence
+as a reason to look, not as a verdict.
+
+**Check the agent can actually use wire before you rely on it.** An agent
+without this skill installed, or without `wire` on its PATH, cannot answer you
+through it — it will fall back to whatever it does know, or not reply at all.
+That failure looks exactly like being ignored, and it is the first thing to rule
+out when a delegate goes quiet. Install the skill and the binary as part of
+setting the agent up, not as part of debugging it.
 
 **If — and only if — you have a durable way to schedule one, set yourself a
 reminder and go do other work.** A background timer, a scheduled wake-up,
