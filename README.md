@@ -11,7 +11,9 @@ wire read worker-a11f3c         # see what it is doing
 
 ## Install
 
-One file, standard library only, no dependencies.
+One file, standard library only, no dependencies. Requires `python3` and `tmux`.
+
+**Copy the file.** Nothing to install — what you download is the program.
 
 ```bash
 curl -O https://raw.githubusercontent.com/jerpint/wire/main/wire
@@ -19,7 +21,21 @@ chmod +x wire && mv wire ~/.local/bin/
 ln -s ~/.local/bin/wire ~/.local/bin/wi   # optional two-letter shortcut
 ```
 
-Requires `python3` and `tmux`.
+**Or with uv**, if you would rather not manage PATH yourself. This installs both
+`wire` and the `wi` shortcut:
+
+```bash
+uv tool install git+https://github.com/jerpint/wire
+```
+
+To try it without installing anything at all:
+
+```bash
+uvx --from git+https://github.com/jerpint/wire wire list
+```
+
+The uv route costs roughly 30ms per call over running the file directly, which
+is not worth thinking about unless you are in a tight loop.
 
 To let an agent use it, drop `SKILL.md` into its skills directory. It will then
 know the verbs without being prompted.
@@ -106,8 +122,11 @@ Worth knowing before you build on it. None of these are hidden.
 
 ## Using it as a library
 
-The executable has no `.py` extension, so `import wire` will not find it as
-shipped. Symlink it:
+Installed with uv, `import wire` just works — the file is installed under an
+importable name.
+
+If you copied the file by hand instead, it has no `.py` extension and Python
+will not find it. Symlink it:
 
 ```bash
 ln -s ~/.local/bin/wire ~/.local/bin/wire.py   # then: import wire
