@@ -34,6 +34,9 @@ To try it without installing anything at all:
 uvx --from git+https://github.com/jerpint/wire wire list
 ```
 
+Pass the git URL. Plain `uvx wire` would fetch an unrelated package of the same
+name from PyPI — this one is not published there.
+
 The uv route costs roughly 30ms per call over running the file directly, which
 is not worth thinking about unless you are in a tight loop.
 

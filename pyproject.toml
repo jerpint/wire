@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "wire-agents"
+name = "wire"
 version = "0.1.0"
 description = "Let CLI coding agents talk to each other."
 readme = "README.md"
