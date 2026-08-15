@@ -367,6 +367,43 @@ def build_command(harness: str, model: str = "", yolo: bool = False) -> str:
     return " ".join(shlex.quote(p) if " " in p else p for p in parts)
 
 
+# TMUX/TMUX_PANE describe the CALLER's pane. Leaking them into a new session
+# makes tools inside it think they are nested somewhere they are not.
+_ENV_SKIP = {"TMUX", "TMUX_PANE"}
+
+
+def _tmux_supports_session_env() -> bool:
+    """`new-session -e` needs tmux 3.0+."""
+    try:
+        out = _run(["tmux", "-V"]).stdout
+    except (HailError, subprocess.CalledProcessError):
+        return False
+    m = re.search(r"(\d+)\.(\d+)", out)
+    if not m:
+        return False
+    return (int(m.group(1)), int(m.group(2))) >= (3, 0)
+
+
+def _env_args(extra: dict | None = None) -> list[str]:
+    """Pass the caller's environment into the new session.
+
+    Without this, a spawned agent inherits the tmux SERVER's environment — the
+    environment whoever started the server happened to have, possibly hours ago
+    and possibly a different user. That silently gives the agent the wrong HOME,
+    so it looks for credentials in the wrong place and comes up logged out, or
+    misses the API key sitting right there in your shell.
+
+    Passing via -e rather than an `env` prefix keeps secrets out of the process
+    table, where anyone running ps could read them.
+    """
+    args: list[str] = []
+    for key, value in {**os.environ, **(extra or {})}.items():
+        if key in _ENV_SKIP or "\n" in value:
+            continue
+        args += ["-e", f"{key}={value}"]
+    return args
+
+
 def wait_ready(session: str, harness: str, timeout: float = 60.0) -> bool:
     """Wait until the agent process is actually up in this session.
 
@@ -381,8 +418,43 @@ def wait_ready(session: str, harness: str, timeout: float = 60.0) -> bool:
     return False
 
 
+# Signatures of a modal that is waiting on a keystroke. A paste delivered into
+# one of these is swallowed, or worse, answers it by accident — so wire refuses
+# to paste and says why. Heuristic by nature: a TUI can always invent a new
+# dialog, which is why the failure is reported rather than worked around.
+_BLOCKING_PROMPTS = (
+    "Enter to confirm",       # claude's trust-this-folder dialog
+    "Press enter to continue",  # codex's
+    "yes, continue",
+    "do you trust",
+    "yes, i trust",
+    "(y/n)",
+    "[y/n]",
+)
+
+
+def pane_blocked(session: str) -> str:
+    """Return the modal line a pane is waiting on, or "" if it is ready.
+
+    Claude asks whether you trust a folder the first time it runs in one, and
+    codex has its own trust dialog. Both appear AFTER the process is up, so
+    "the process exists" is not the same as "the TUI will accept input".
+    """
+    try:
+        pane = _run(["tmux", "capture-pane", "-p", "-t", session, "-S", "-30"]).stdout
+    except (HailError, subprocess.CalledProcessError):
+        return ""
+    low = pane.lower()
+    for sig in _BLOCKING_PROMPTS:
+        if sig.lower() in low:
+            for line in pane.splitlines():
+                if sig.lower() in line.lower():
+                    return line.strip()
+    return ""
+
+
 def spawn(harness: str, seed: str = "", name: str = "", model: str = "",
-          yolo: bool = False, cwd: str = "") -> dict:
+          yolo: bool = False, cwd: str = "", env: dict | None = None) -> dict:
     """Start an agent in a new detached tmux session and optionally brief it.
 
     The seed prompt is pasted after the TUI is up rather than passed on the
@@ -399,6 +471,13 @@ def spawn(harness: str, seed: str = "", name: str = "", model: str = "",
     tmux_cmd = ["tmux", "new-session", "-d", "-s", session]
     if cwd:
         tmux_cmd += ["-c", cwd]
+    if _tmux_supports_session_env():
+        tmux_cmd += _env_args(env)
+    elif env:
+        raise HailError(
+            "tmux 3.0+ is required to pass environment to a new session; "
+            f"this is {_run(['tmux', '-V']).stdout.strip()}"
+        )
     tmux_cmd.append(cmd)
     try:
         _run(tmux_cmd)
@@ -415,6 +494,10 @@ def spawn(harness: str, seed: str = "", name: str = "", model: str = "",
             f"`tmux attach -t {session}` to see what happened."
         )
     time.sleep(1.0)  # let the TUI paint before pasting into it
+    blocked = pane_blocked(session)
+    if blocked:
+        result["blocked_on"] = blocked
+        return result
     body = format_envelope(seed, whoami())
     paste(session, _guard(body, harness), harness)
     result["briefed"] = True
@@ -446,12 +529,26 @@ def _cmd_send(args) -> int:
 
 
 def _cmd_spawn(args) -> int:
+    extra = {}
+    for pair in args.env:
+        key, _, value = pair.partition("=")
+        if not key or not _:
+            raise HailError(f"--env expects KEY=VALUE, got {pair!r}")
+        extra[key] = value
     result = spawn(args.harness, seed=args.seed, name=args.name,
-                   model=args.model, yolo=args.yolo, cwd=args.cwd)
+                   model=args.model, yolo=args.yolo, cwd=args.cwd, env=extra)
     print(f"SESSION={result['session']}")
     print(f"ATTACH=tmux attach -t {result['session']}")
     if args.seed and not result["briefed"]:
-        print("warning: started but not briefed", file=sys.stderr)
+        reason = result.get("blocked_on")
+        if reason:
+            print(f"started, NOT briefed — it is waiting on a prompt: {reason}\n"
+                  f"answer it with `tmux attach -t {result['session']}`, "
+                  f"then `{_PREFIX} send {result['session']} \"...\"`",
+                  file=sys.stderr)
+        else:
+            print("started but not briefed", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -491,6 +588,8 @@ def build_parser() -> argparse.ArgumentParser:
     spw.add_argument("--name", default="", help="tmux session name")
     spw.add_argument("--model", default="")
     spw.add_argument("--cwd", default="", help="working directory")
+    spw.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
+                     help="add or override an environment variable (repeatable)")
     spw.add_argument("--yolo", action="store_true",
                      help="skip the agent's own permission prompts")
     spw.set_defaults(func=_cmd_spawn)

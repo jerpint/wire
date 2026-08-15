@@ -48,6 +48,32 @@ access will happily execute a message that looks like one, so the message must
 not look like one. The reply verb is taught by the skill, not embedded in the
 body.
 
+## Spawning gotchas
+
+Both are handled, and both are worth knowing about.
+
+**A new tmux session inherits the tmux *server's* environment, not yours.** The
+server keeps whatever environment it was started with, possibly hours ago and
+possibly as a different user — so a spawned agent can end up with the wrong
+`HOME` and come up logged out, or miss the API key sitting right there in your
+shell. `wire spawn` passes your environment through explicitly (via `tmux -e`,
+so secrets stay out of the process table). Add or override with
+`--env KEY=VALUE`.
+
+**An agent can be running and still not ready for input.** Claude asks whether
+you trust a folder the first time it runs in one, and codex has its own version.
+Both appear after the process is up, so "the process exists" is not the same as
+"the TUI will accept input" — a seed prompt pasted into a modal is swallowed, or
+answers it by accident. `wire spawn` checks, refuses to paste, and tells you
+which prompt is in the way:
+
+```
+started, NOT briefed — it is waiting on a prompt: Enter to confirm · Esc to cancel
+answer it with `tmux attach -t worker-a11f3c`, then `wire send worker-a11f3c "..."`
+```
+
+It exits nonzero, so a script will notice.
+
 ## Harnesses
 
 `claude`, `codex`, `opencode`. Each has its own TUI quirks, all of which were
