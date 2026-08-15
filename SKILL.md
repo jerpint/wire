@@ -76,6 +76,39 @@ to you without being told how.
 
 Harnesses: `claude`, `codex`, `opencode`.
 
+## Keeping track of an agent you delegated to
+
+Nothing here is a rule. Supervision is your call, because only you know what
+"going well" means for the task you handed over.
+
+**Don't poll.** When the agent you spawned replies, it arrives as a message in
+your own session. You don't have to watch for it — you'll be told. Checking
+repeatedly costs you attention and usually finds nothing.
+
+**Ask for an ack when the cost of a silent failure is high.** Add something like
+"reply immediately to confirm you've started" to the seed prompt. An agent that
+never acks failed in a way you'd otherwise discover much later — it never
+started, it's sitting on a permission prompt, or it died at boot.
+
+**Then set yourself a reminder and go do other work.** If the ack arrives,
+there's nothing to do. If your reminder fires and you still haven't heard
+anything, *now* read the pane — deliberately, once. That read is worth doing
+precisely because you already know something is off.
+
+**Pick the interval from the cost of a wrong direction, not the length of the
+task.** A well-specified, isolated fix needs no check even if it runs long. A
+refactor touching forty files deserves an early look, because ten minutes of
+confidently wrong is expensive to unwind.
+
+**"Did it start?" and "is it on track?" want different tools.** Reading answers
+the first immediately. It answers the second badly: a pane shows the last
+screen, and by the time you look, the reasoning that would tell you the
+trajectory has scrolled away. For progress, ask the agent for a checkpoint — it
+can summarise what it actually did, where the screen only shows the most recent
+thing it happened to print.
+
+So: read for liveness, ask for progress, and do neither unless you have a reason.
+
 ## See what an agent is doing
 
 ```bash
@@ -99,6 +132,9 @@ A few things worth knowing:
   work, and it will wire you back when it has something.
 - **Do not poll an agent that has finished.** Reading is free, but sending wakes
   it up again.
+- **Supervision is the delegator's job, not the tool's.** wire will not chase an
+  agent for you, because whether that is worth doing depends on the task. See
+  "Keeping track of an agent you delegated to" above.
 
 ## Using it from Python
 
