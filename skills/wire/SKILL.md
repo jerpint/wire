@@ -27,6 +27,15 @@ review-8b02de   opencode
 
 Those names are addresses. `wire whoami` prints your own.
 
+Some addresses look like `%57` instead of a name. That is a pane id, and it is
+a perfectly good address — you get one when an agent shares a tmux session with
+another, so no name would identify it unambiguously. Use it exactly as you
+would a name.
+
+Whatever `wire list` shows, and whatever a message's `reply-to` says, is
+something `wire send` accepts. If a target could mean two agents, wire refuses
+and lists them rather than guessing — pick one of the pane ids it offers.
+
 ## Send a message
 
 ```bash
