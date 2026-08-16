@@ -517,6 +517,44 @@ def send(target: str, message: str, from_addr: str | None = None) -> dict:
     return agent
 
 
+def name_agent(target: str, name: str) -> dict:
+    """Give an already-running agent a stable address.
+
+    `spawn` does this for agents it starts, but most agents wire talks to it
+    never launched — a human opened a pane and started one. Those fall back to
+    a session name, or to a pane id once a second agent joins the session, and
+    without this there is no way to promote them back to something memorable.
+
+    Refuses a name another agent already answers to. Names win over session
+    names in resolve(), so allowing a collision would silently demote the other
+    agent's address to a pane id.
+    """
+    agent = resolve(target)
+    if not name:
+        _run(["tmux", "set", "-pu", "-t", agent["pane"], "@wire_name"], check=False)
+        agent["name"] = ""
+        return agent
+    clean = _clean_addr(name)
+    if not clean:
+        raise WireError(f"{name!r} leaves nothing usable as a name")
+    if clean.startswith("%"):
+        raise WireError(f"{clean!r} cannot be a name — % means a pane id")
+    for other in agents():
+        if other["pane"] == agent["pane"]:
+            continue
+        if other["name"] == clean:
+            raise WireError(f"{clean!r} is already the name of {other['pane']}")
+        if other["session"] == clean:
+            raise WireError(
+                f"{clean!r} is already the session name of {other['addr']} — "
+                f"a wire name would shadow it"
+            )
+    set_wire_name(agent["pane"], clean)
+    agent["name"] = clean
+    agent["addr"] = clean
+    return agent
+
+
 def read(target: str, lines: int = 40) -> str:
     """Capture what an agent's pane currently shows."""
     agent = resolve(target)
@@ -770,6 +808,23 @@ def _cmd_spawn(args) -> int:
     return 0
 
 
+def _cmd_name(args) -> int:
+    agent = name_agent(args.target, "" if args.clear else args.name)
+    if not agent["name"]:
+        print(f"cleared → {agent['pane']} is now addressed as {agents_addr(agent['pane'])}")
+    else:
+        print(f"{agent['pane']} is now addressed as {agent['name']}")
+    return 0
+
+
+def agents_addr(pane: str) -> str:
+    """The address a pane currently answers to. Used to report a cleared name."""
+    for a in agents():
+        if a["pane"] == pane:
+            return a["addr"]
+    return pane
+
+
 def _cmd_read(args) -> int:
     print(read(args.target, lines=args.lines))
     return 0
@@ -814,6 +869,12 @@ def build_parser() -> argparse.ArgumentParser:
     spw.add_argument("--yolo", action="store_true",
                      help="skip the agent's own permission prompts")
     spw.set_defaults(func=_cmd_spawn)
+
+    nm = sub.add_parser("name", help="give a running agent a stable address")
+    nm.add_argument("target", help="current address: name, session or pane id")
+    nm.add_argument("name", nargs="?", default="", help="the new address")
+    nm.add_argument("--clear", action="store_true", help="remove the name")
+    nm.set_defaults(func=_cmd_name)
 
     rd = sub.add_parser("read", help="read what an agent currently shows")
     rd.add_argument("target")

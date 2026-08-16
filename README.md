@@ -95,6 +95,17 @@ Panes cannot be renamed — there is no `rename-pane`, and `pane_title` is
 continuously overwritten by the harness with whatever it is currently doing. A
 pane user option is the one place a name stays put.
 
+Most agents wire talks to it never launched, so any running agent can be given
+one after the fact:
+
+```bash
+wire name %64 alpha        # promote a pane id to a memorable address
+wire name alpha --clear    # back to whatever it falls through to
+```
+
+A name another agent already answers to is refused rather than allowed to
+shadow it.
+
 The scope limit is the tmux **server**, not the session. A second server
 (`tmux -L other`) has its own `%1`, `%2`… and is invisible to `list-panes -a`.
 

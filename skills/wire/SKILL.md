@@ -36,6 +36,13 @@ Whatever `wire list` shows, and whatever a message's `reply-to` says, is
 something `wire send` accepts. If a target could mean two agents, wire refuses
 and lists them rather than guessing — pick one of the pane ids it offers.
 
+If you are juggling several agents and the pane ids are getting hard to keep
+straight, give them names:
+
+```bash
+wire name %64 parser
+```
+
 ## Send a message
 
 ```bash
