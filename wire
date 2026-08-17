@@ -37,7 +37,7 @@ import subprocess
 import sys
 import time
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 TMUX_TIMEOUT = 10
 _PREFIX = "wire"
