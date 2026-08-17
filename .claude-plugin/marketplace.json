@@ -1,0 +1,14 @@
+{
+  "name": "wire",
+  "description": "wire — let CLI coding agents talk to each other",
+  "owner": {
+    "name": "jerpint"
+  },
+  "plugins": [
+    {
+      "name": "wire",
+      "source": "./",
+      "description": "Let CLI coding agents talk to each other — message, read and spawn agents running in tmux"
+    }
+  ]
+}
