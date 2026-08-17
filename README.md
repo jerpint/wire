@@ -60,10 +60,54 @@ your PATH. Install the binary separately, as above.
 
 ## How it works
 
-tmux is the database. Sessions are the address book, and a walk of each pane's
-process tree says which sessions are live agents and which harness each one
-runs. There is no registry, no config file and no daemon — which is why wire
-works on agents it never launched, including ones a human started by hand.
+tmux is the database. A walk of each pane's process tree says which panes are
+live agents and which harness each one runs. There is no registry, no config
+file and no daemon — which is why wire works on agents it never launched,
+including ones a human started by hand.
+
+## Addressing
+
+The agent lives in a **pane**, so the pane is the identity. Sessions and
+windows are the layers above it, and neither is reliably one-to-one with an
+agent — a session can hold four.
+
+`wire list` prints one address per agent, in descending order of niceness:
+
+| address | what it is | when you get it |
+|---|---|---|
+| `worker-a11f3c` | `@wire_name`, a tmux pane option wire sets when it spawns | the name is unique |
+| `my-session` | the session name | the session holds exactly one agent |
+| `%57` | the pane id — unique per server, never reused | always, as the fallback |
+
+The rule holding it together is a round trip:
+
+```
+resolve(whoami()) is me
+```
+
+Whatever `wire list` prints, and whatever an envelope's `reply-to` says, is a
+target `wire send` accepts. A name that two agents could answer to is never
+offered as an address — `resolve` raises and names the candidates instead of
+guessing, because a message delivered into the wrong pane looks like success to
+the sender and like an interruption to a stranger.
+
+Panes cannot be renamed — there is no `rename-pane`, and `pane_title` is
+continuously overwritten by the harness with whatever it is currently doing. A
+pane user option is the one place a name stays put.
+
+Most agents wire talks to it never launched, so any running agent can be given
+one after the fact:
+
+```bash
+wire name %64 alpha        # promote a pane id to a memorable address
+wire name alpha --clear    # back to whatever it falls through to
+```
+
+A name another agent already answers to is refused rather than allowed to
+shadow it.
+
+The scope limit is the tmux **server**, not the session. A second server
+(`tmux -L other`) has its own `%1`, `%2`… and is invisible to `list-panes -a`.
 
 ## The envelope
 

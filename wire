@@ -170,27 +170,93 @@ def _process_table() -> tuple[dict[str, list[str]], dict[str, str]]:
     return children, comms
 
 
-def _panes(session: str) -> list[tuple[str, str]]:
-    """[(pane_id, pane_pid)] for EVERY pane in a session. pane_id looks like "%12".
+# Field order matters. pane_id ("%12"), pane_pid (digits) and wire_name
+# (sanitised on the way in) can never contain the separator; session_name can
+# contain anything at all, so it goes LAST and is split off with maxsplit.
+# ":" is belt and braces on top of that — tmux rewrites ":" to "_" in session
+# names, so it cannot appear there even by accident.
+_PANE_FMT = "#{pane_id}:#{pane_pid}:#{@wire_name}:#{session_name}"
 
-    -s makes this session-wide. Without it tmux lists only the selected
-    window's panes, so an agent sitting in any other window is invisible —
-    and which agent you can see would depend on which window happens to be
-    selected at the time.
+
+def _all_panes() -> list[tuple[str, str, str, str]]:
+    """[(pane_id, pane_pid, wire_name, session)] for EVERY pane on the server.
+
+    One `list-panes -a` for the whole server, deliberately. The obvious
+    alternative — walking sessions and asking for each one's panes — passes a
+    session NAME as a tmux target, and tmux does not resolve a bare target the
+    way you would hope: a numeric name like "1" is matched against the CURRENT
+    session's windows first, so `list-panes -s -t 1` run from session 6 returns
+    session 6's panes. Default tmux session names are numeric, so that
+    misattributes exactly the hand-started sessions wire exists to find, and a
+    message addressed to one agent gets delivered into another.
+
+    Asking the server for everything at once sidesteps target parsing entirely,
+    and costs one subprocess instead of one per session.
     """
     try:
-        out = _run([
-            "tmux", "list-panes", "-s", "-t", session,
-            "-F", "#{pane_id} #{pane_pid}",
-        ]).stdout
+        out = _run(["tmux", "list-panes", "-a", "-F", _PANE_FMT]).stdout
     except subprocess.CalledProcessError:
-        return []
+        return []  # no server running == no panes
     panes = []
     for line in out.strip().split("\n"):
-        parts = line.split()
-        if len(parts) == 2:
-            panes.append((parts[0], parts[1]))
+        if not line:
+            continue
+        parts = line.split(":", 3)
+        if len(parts) == 4:
+            panes.append((parts[0], parts[1], parts[2], parts[3]))
     return panes
+
+
+def set_wire_name(pane: str, name: str) -> None:
+    """Give a pane a stable wire address, stored as a tmux pane option.
+
+    A pane option is the only place on a pane that stays put. Panes cannot be
+    renamed at all — there is no `rename-pane` — and `pane_title`, the obvious
+    candidate, is continuously overwritten by the harness with whatever it is
+    currently doing ("✳ Review and discuss pull request"). A user option is
+    ours alone; tmux never touches it and neither does the TUI.
+
+    Sanitised to the same character set as an envelope address, so a name can
+    never contain the field separator or forge header structure.
+    """
+    clean = _clean_addr(name)
+    if clean:
+        _run(["tmux", "set", "-p", "-t", pane, "@wire_name", clean], check=False)
+
+
+def _scan() -> list[dict]:
+    """Every agent on the tmux server, one pane at a time.
+
+    Walks the FULL subtree under each pane pid, not just direct children — the
+    real tree is pane(bash) -> wrapper -> agent, so checking direct children
+    alone always misses it.
+    """
+    panes = _all_panes()
+    if not panes:
+        return []
+    children, comms = _process_table()
+    by_comm = {}
+    for name, entry in HARNESSES.items():
+        for pname in entry["process_names"]:
+            by_comm[pname] = name
+
+    found = []
+    for pane_id, pane_pid, wire_name, session in panes:
+        queue = [pane_pid]
+        seen: set[str] = set()
+        while queue:
+            cur = queue.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            hit = by_comm.get(comms.get(cur, ""))
+            if hit:
+                found.append({"session": session, "pane": pane_id,
+                              "harness": hit, "label": HARNESSES[hit]["label"],
+                              "name": wire_name})
+                break
+            queue.extend(children.get(cur, []))
+    return found
 
 
 def find_agents(session: str) -> list[tuple[str, str]]:
@@ -201,30 +267,7 @@ def find_agents(session: str) -> list[tuple[str, str]]:
     honest; picking the first would make the address silently mean whichever
     tmux happened to list earliest.
     """
-    panes = _panes(session)
-    if not panes:
-        return []
-    children, comms = _process_table()
-    by_comm = {}
-    for name, entry in HARNESSES.items():
-        for pname in entry["process_names"]:
-            by_comm[pname] = name
-
-    found = []
-    for pane_id, pane_pid in panes:
-        queue = [pane_pid]
-        seen: set[str] = set()
-        while queue:
-            cur = queue.pop()
-            if cur in seen:
-                continue
-            seen.add(cur)
-            hit = by_comm.get(comms.get(cur, ""))
-            if hit:
-                found.append((hit, pane_id))
-                break
-            queue.extend(children.get(cur, []))
-    return found
+    return [(a["harness"], a["pane"]) for a in _scan() if a["session"] == session]
 
 
 def find_agent(session: str) -> tuple[str, str] | None:
@@ -252,54 +295,91 @@ def detect_harness(session: str) -> str | None:
 
 
 def agents() -> list[dict]:
-    """Every tmux session that is running a known agent.
+    """Every agent on the tmux server, each with an unambiguous address.
 
     This is the whole address book. No state file is consulted, which is why
     wire works on sessions it never launched.
+
+    Every record carries an `addr` that resolve() is guaranteed to map back to
+    that same pane. Three kinds of address, in descending order of niceness:
+
+        %57              the pane id. Always unique, always works, always ugly.
+        worker-a11f3c    @wire_name, a pane option wire sets when it spawns.
+        my-session       the session name — an alias, and only an address when
+                         the session holds exactly one agent.
+
+    The pane is the identity; the other two are conveniences that get withdrawn
+    the moment they stop being unique. Nothing here is ever ambiguous: a name
+    that two agents could answer to is not offered as an address at all.
     """
-    out = []
-    for name in tmux_sessions():
-        found = find_agents(name)
-        for harness, pane in found:
-            out.append({"session": name, "harness": harness, "pane": pane,
-                        "label": HARNESSES[harness]["label"],
-                        # True when this session holds more than one agent, so
-                        # the session name alone is not a usable address.
-                        "shared_session": len(found) > 1})
-    return out
+    found = _scan()
+    by_name: dict[str, list[dict]] = {}
+    by_session: dict[str, list[dict]] = {}
+    for a in found:
+        if a["name"]:
+            by_name.setdefault(a["name"], []).append(a)
+        by_session.setdefault(a["session"], []).append(a)
+
+    # Mirror resolve()'s precedence exactly — name, then session, then pane —
+    # so `addr` is by construction a target that resolves back to this pane.
+    # Deriving it any other way invites the two to drift, and the symptom of
+    # drift is an address the address book prints and resolve() then rejects.
+    for a in found:
+        # True when this session holds more than one agent, so the session name
+        # alone is not a usable address.
+        a["shared_session"] = len(by_session[a["session"]]) > 1
+        if a["name"] and len(by_name[a["name"]]) == 1:
+            a["addr"] = a["name"]
+        elif a["session"] not in by_name and not a["shared_session"]:
+            # A session name loses to a wire name of the same spelling, because
+            # that is the order resolve() tries them in.
+            a["addr"] = a["session"]
+        else:
+            a["addr"] = a["pane"]
+    return found
 
 
 def resolve(target: str) -> dict:
-    """Resolve a target to an agent record.
+    """Resolve a target to exactly one agent record, or refuse.
 
-    Accepts an exact tmux session name, or a unique prefix of one.
+    Accepts a pane id, a wire name, a session name, or a unique prefix of
+    either name. Tried in that order, most specific first.
+
+    The contract is that this never guesses. Where a target could mean two
+    agents it raises and names them, because the failure it is guarding against
+    is silent: a message delivered confidently into the wrong agent's pane reads
+    as `delivered` to the sender and as an interruption to a stranger.
     """
     found = agents()
-    # A pane id is always an exact address, and it is the way out of the
-    # ambiguity below.
+    # A pane id is always exact, and it is the way out of every ambiguity below.
     if target.startswith("%"):
         by_pane = [a for a in found if a["pane"] == target]
         if by_pane:
             return by_pane[0]
         raise WireError(f"no agent in pane {target}")
-    exact = [a for a in found if a["session"] == target]
-    if len(exact) == 1:
-        return exact[0]
-    if len(exact) > 1:
-        panes = ", ".join(f"{a['pane']} ({a['harness']})" for a in exact)
-        raise WireError(
-            f"session {target!r} holds {len(exact)} agents — address one by "
-            f"pane: {panes}"
-        )
-    partial = [a for a in found if a["session"].startswith(target)]
+
+    for field in ("name", "session"):
+        exact = [a for a in found if a[field] == target]
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            panes = ", ".join(f"{a['pane']} ({a['harness']})" for a in exact)
+            raise WireError(
+                f"{field} {target!r} holds {len(exact)} agents — address one by "
+                f"pane: {panes}"
+            )
+
+    partial = [a for a in found
+               if a["session"].startswith(target)
+               or (a["name"] and a["name"].startswith(target))]
     if len(partial) == 1:
         return partial[0]
     if len(partial) > 1:
-        names = ", ".join(f"{a['session']} {a['pane']}" for a in partial)
+        names = ", ".join(a["addr"] for a in partial)
         raise WireError(f"{target!r} is ambiguous: {names}")
     if not found:
         raise WireError("no agents running. `wire list` to check.")
-    names = ", ".join(a["session"] for a in found)
+    names = ", ".join(a["addr"] for a in found)
     raise WireError(f"no agent named {target!r}. running: {names}")
 
 
@@ -310,18 +390,37 @@ def resolve(target: str) -> dict:
 def whoami() -> str:
     """This agent's own address, if it is running inside one.
 
-    WIRE_FROM lets a caller override. Otherwise the enclosing tmux session name
-    is the honest answer.
+    Holds one invariant, which is the whole point of the address scheme:
+
+        resolve(whoami()) is me
+
+    So this returns the same `addr` the address book advertises, and never a
+    name the sender could not be reached at. The old answer — the enclosing
+    session name — broke the invariant for every agent sharing a session with
+    another: four agents in one session all claimed `reply-to: 0`, and `0` is
+    precisely the target resolve() refuses as ambiguous. The envelope exists to
+    make a reply possible, so handing back an unreplyable address defeats it.
+
+    $TMUX_PANE, not `display-message`: tmux sets it per pane, so it is correct
+    from a background pane. `display-message` reports whichever pane is ACTIVE
+    in the session, which is a different pane whenever the agent is not the one
+    on screen.
+
+    WIRE_FROM overrides everything, for callers that know better.
     """
     override = os.environ.get("WIRE_FROM")
     if override:
         return override
-    if os.environ.get("TMUX"):
-        try:
-            return _run(["tmux", "display-message", "-p", "#{session_name}"]).stdout.strip()
-        except (WireError, subprocess.CalledProcessError):
-            pass
-    return ""
+    pane = os.environ.get("TMUX_PANE", "")
+    if not pane:
+        return ""
+    for a in agents():
+        if a["pane"] == pane:
+            return a["addr"]
+    # In a pane with no recognised agent — a plain shell, say. The pane id is
+    # still the truthful answer: a reply to it will fail loudly rather than
+    # land somewhere else.
+    return pane
 
 
 def _clean_addr(addr: str) -> str:
@@ -334,8 +433,12 @@ def _clean_addr(addr: str) -> str:
 
     This makes the envelope well-formed. It does NOT make it authentic: nothing
     here proves a sender is who it claims. See the trust note in the README.
+
+    "%" is in the keep set because a pane id is a real address — strip it and
+    `%57` becomes `57`, a reply-to that resolves to nothing or, worse, to some
+    unrelated session that happens to be named "57".
     """
-    return re.sub(r"[^\w.@:-]", "", addr)[:120]
+    return re.sub(r"[^\w.@:%-]", "", addr)[:120]
 
 
 def format_envelope(text: str, from_addr: str = "") -> str:
@@ -411,6 +514,44 @@ def send(target: str, message: str, from_addr: str | None = None) -> dict:
     sender = whoami() if from_addr is None else from_addr
     body = format_envelope(message, sender)
     paste(agent["pane"], _guard(body, agent["harness"]), agent["harness"])
+    return agent
+
+
+def name_agent(target: str, name: str) -> dict:
+    """Give an already-running agent a stable address.
+
+    `spawn` does this for agents it starts, but most agents wire talks to it
+    never launched — a human opened a pane and started one. Those fall back to
+    a session name, or to a pane id once a second agent joins the session, and
+    without this there is no way to promote them back to something memorable.
+
+    Refuses a name another agent already answers to. Names win over session
+    names in resolve(), so allowing a collision would silently demote the other
+    agent's address to a pane id.
+    """
+    agent = resolve(target)
+    if not name:
+        _run(["tmux", "set", "-pu", "-t", agent["pane"], "@wire_name"], check=False)
+        agent["name"] = ""
+        return agent
+    clean = _clean_addr(name)
+    if not clean:
+        raise WireError(f"{name!r} leaves nothing usable as a name")
+    if clean.startswith("%"):
+        raise WireError(f"{clean!r} cannot be a name — % means a pane id")
+    for other in agents():
+        if other["pane"] == agent["pane"]:
+            continue
+        if other["name"] == clean:
+            raise WireError(f"{clean!r} is already the name of {other['pane']}")
+        if other["session"] == clean:
+            raise WireError(
+                f"{clean!r} is already the session name of {other['addr']} — "
+                f"a wire name would shadow it"
+            )
+    set_wire_name(agent["pane"], clean)
+    agent["name"] = clean
+    agent["addr"] = clean
     return agent
 
 
@@ -580,7 +721,16 @@ def spawn(harness: str, seed: str = "", name: str = "", model: str = "",
     except subprocess.CalledProcessError as e:
         raise WireError(f"could not start tmux session: {e.stderr.strip()}") from None
 
-    result = {"session": session, "harness": harness,
+    # Stamp the address onto the pane now, while the session is guaranteed to
+    # hold exactly one. Done here rather than after the agent boots so it also
+    # covers a seedless spawn, and so the address survives the session being
+    # renamed or a second agent being opened alongside this one later.
+    for pane_id, _pid, _wname, sess in _all_panes():
+        if sess == session:
+            set_wire_name(pane_id, session)
+            break
+
+    result = {"session": session, "harness": harness, "addr": session,
               "label": entry["label"], "briefed": False}
     if not seed:
         return result
@@ -617,17 +767,18 @@ def _cmd_list(args) -> int:
     if not found:
         print("no agents running.")
         return 0
-    width = max(len(a["session"]) for a in found)
+    # One column, always the address you can actually send to. Printing the
+    # session name and hoping would put a target in front of the reader that
+    # resolve() then refuses.
+    width = max(len(a["addr"]) for a in found)
     for a in found:
-        # Only show the pane when the session name is not enough to address it.
-        suffix = f" {a['pane']}" if a.get("shared_session") else ""
-        print(f"{a['session']:<{width}}{suffix}  {a['label']}")
+        print(f"{a['addr']:<{width}}  {a['label']}")
     return 0
 
 
 def _cmd_send(args) -> int:
     agent = send(args.target, args.message, from_addr=args.from_addr)
-    print(f"delivered → {agent['session']} ({agent['label']})")
+    print(f"delivered → {agent['addr']} ({agent['label']})")
     return 0
 
 
@@ -641,6 +792,7 @@ def _cmd_spawn(args) -> int:
     result = spawn(args.harness, seed=args.seed, name=args.name,
                    model=args.model, yolo=args.yolo, cwd=args.cwd, env=extra,
                    inherit_env=not args.no_inherit_env)
+    print(f"ADDR={result['addr']}")
     print(f"SESSION={result['session']}")
     print(f"ATTACH=tmux attach -t {result['session']}")
     if args.seed and not result["briefed"]:
@@ -654,6 +806,23 @@ def _cmd_spawn(args) -> int:
             print("started but not briefed", file=sys.stderr)
         return 1
     return 0
+
+
+def _cmd_name(args) -> int:
+    agent = name_agent(args.target, "" if args.clear else args.name)
+    if not agent["name"]:
+        print(f"cleared → {agent['pane']} is now addressed as {agents_addr(agent['pane'])}")
+    else:
+        print(f"{agent['pane']} is now addressed as {agent['name']}")
+    return 0
+
+
+def agents_addr(pane: str) -> str:
+    """The address a pane currently answers to. Used to report a cleared name."""
+    for a in agents():
+        if a["pane"] == pane:
+            return a["addr"]
+    return pane
 
 
 def _cmd_read(args) -> int:
@@ -700,6 +869,12 @@ def build_parser() -> argparse.ArgumentParser:
     spw.add_argument("--yolo", action="store_true",
                      help="skip the agent's own permission prompts")
     spw.set_defaults(func=_cmd_spawn)
+
+    nm = sub.add_parser("name", help="give a running agent a stable address")
+    nm.add_argument("target", help="current address: name, session or pane id")
+    nm.add_argument("name", nargs="?", default="", help="the new address")
+    nm.add_argument("--clear", action="store_true", help="remove the name")
+    nm.set_defaults(func=_cmd_name)
 
     rd = sub.add_parser("read", help="read what an agent currently shows")
     rd.add_argument("target")
