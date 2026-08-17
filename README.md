@@ -40,8 +40,23 @@ name from PyPI — this one is not published there.
 The uv route costs roughly 30ms per call over running the file directly, which
 is not worth thinking about unless you are in a tight loop.
 
-To let an agent use it, drop `SKILL.md` into its skills directory. It will then
-know the verbs without being prompted.
+### Teaching an agent the verbs
+
+Installing the binary is half of it. An agent also needs the skill, or it will
+not know wire exists — and an agent that cannot answer you looks exactly like
+one ignoring you.
+
+As a plugin, which covers every Claude Code session on the machine at once:
+
+```bash
+claude plugin marketplace add jerpint/wire   # or a local path
+claude plugin install wire@wire
+```
+
+Or drop `skills/wire/SKILL.md` into any agent's own skills directory.
+
+The plugin ships the skill, not the binary — plugins cannot put anything on
+your PATH. Install the binary separately, as above.
 
 ## How it works
 

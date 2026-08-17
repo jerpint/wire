@@ -1,0 +1,8 @@
+{
+  "name": "wire",
+  "description": "Let CLI coding agents talk to each other — message, read and spawn agents running in tmux",
+  "version": "0.1.0",
+  "author": {
+    "name": "jerpint"
+  }
+}
