@@ -6,6 +6,7 @@ Let CLI coding agents talk to each other.
 wire list                       # which agents are running
 wire send worker-a11f3c "..."   # message one, with a return address
 wire spawn claude "seed"        # start one and brief it
+wire spawn claude "seed" --split-of %12  # or split beside an existing pane
 wire read worker-a11f3c         # see what it is doing
 ```
 
@@ -152,6 +153,20 @@ body.
 
 Both are handled, and both are worth knowing about.
 
+By default, `wire spawn` creates a detached tmux session. To put the new agent
+beside an existing pane instead, pass its tmux pane id:
+
+```bash
+wire spawn claude "review this change" --model sonnet --split-of %12
+```
+
+The new pane receives its own stable Wire address and inherits the target
+pane's window layout. `--cwd` can override the split pane's working directory.
+A split uses the target tmux session's environment by default instead of
+copying the caller's, keeping orchestrator state such as `NO_COLOR` and
+`CODEX_*` out of the interactive child. Pass `--inherit-env` when copying the
+caller's environment is intentional.
+
 **A new tmux session inherits the tmux *server's* environment, not yours.** The
 server keeps whatever environment it was started with, possibly hours ago and
 possibly as a different user — so a spawned agent can end up with the wrong
@@ -202,7 +217,8 @@ Worth knowing before you build on it. None of these are hidden.
   not give a clean one — the tmux server passes its own environment to every
   pane it creates, and that belongs to whoever started the server. The choice is
   between your environment and the server's, not between one and none. Name what
-  you need with `--env` either way.
+  you need with `--env` either way. Split spawns use this tmux-only behavior by
+  default; pass `--inherit-env` to copy the caller instead.
 
 ## Using it as a library
 
@@ -223,7 +239,7 @@ found against a live terminal:
 
 | harness  | quirk |
 |---|---|
-| Claude Code | paste-aware; a newline inside a paste is literal, so Enter must be a separate keystroke |
+| Claude Code | paste-aware; a newline inside a paste is literal, so Enter must be a separate keystroke after a short settle |
 | Codex | folds an Enter arriving right after a paste into the paste — needs a settle first |
 | opencode | not paste-aware; drops newlines entirely, and a leading `/` opens its command palette |
 
