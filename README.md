@@ -58,6 +58,28 @@ Or drop `skills/wire/SKILL.md` into any agent's own skills directory.
 The plugin ships the skill, not the binary — plugins cannot put anything on
 your PATH. Install the binary separately, as above.
 
+### Releasing a change to the skill
+
+`claude plugin install` takes a **snapshot**. Even from a local directory
+source, the plugin is copied to `~/.claude/plugins/cache/wire/wire/<version>/`,
+so editing this repo does not reach sessions that already installed it.
+
+`claude plugin update` compares the version in `.claude-plugin/plugin.json` and
+nothing else. Leave that number alone and it reports success while continuing to
+serve the old skill — the one failure mode worse than an error. So bump it:
+
+```bash
+# .claude-plugin/plugin.json  →  "version": "0.1.2"
+claude plugin update wire@wire     # then restart the session
+```
+
+`wire`'s own `__version__` is the source of truth for the Python package
+(`pyproject.toml` reads it, rather than repeating it). `plugin.json` is static
+JSON and cannot, so it is the one number to keep in step by hand.
+
+Agents already running keep the skill they booted with; a restart is what picks
+up a new one.
+
 ## How it works
 
 tmux is the database. A walk of each pane's process tree says which panes are

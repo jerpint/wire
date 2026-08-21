@@ -1,7 +1,7 @@
 {
   "name": "wire",
-  "description": "Let CLI coding agents talk to each other — message, read and spawn agents running in tmux",
-  "version": "0.1.0",
+  "description": "Let CLI coding agents talk to each other \u2014 message, read and spawn agents running in tmux",
+  "version": "0.1.1",
   "author": {
     "name": "jerpint"
   }

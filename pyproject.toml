@@ -4,7 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wire"
-version = "0.1.0"
+# Read from wire's own __version__ rather than repeated here, so the package
+# and the program can never disagree about what they are.
+dynamic = ["version"]
 description = "Let CLI coding agents talk to each other."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,6 +15,9 @@ dependencies = []
 [project.scripts]
 wire = "wire:main"
 wi = "wire:main"
+
+[tool.hatch.version]
+path = "wire"
 
 # The shipped file has no .py extension so it can be curled and run directly.
 # Install it under an importable name without keeping a second copy in the repo.
