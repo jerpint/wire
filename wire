@@ -58,9 +58,11 @@ HARNESSES = {
         # comm names that mean "the agent is running" in a process tree
         "process_names": {"claude"},
         # Claude's TUI is paste-aware: a \n inside a paste is a literal newline,
-        # so a trailing Enter must be a SEPARATE keystroke. It accepts that
-        # Enter immediately.
-        "paste_settle": 0.0,
+        # so Enter must be a SEPARATE keystroke. Give the TUI one render tick
+        # first; an immediate Enter intermittently gets absorbed by the paste
+        # and strands the message in the composer. Worktui independently uses
+        # the same 200 ms settle for reliable Claude submission.
+        "paste_settle": 0.2,
         # Paste-aware TUIs render multi-line pastes correctly.
         "flatten_paste_newlines": False,
         "leading_slash_opens_palette": False,
@@ -640,15 +642,17 @@ def _env_args(extra: dict | None = None, inherit: bool = True) -> list[str]:
     return args
 
 
-def wait_ready(session: str, harness: str, timeout: float = 60.0) -> bool:
-    """Wait until the agent process is actually up in this session.
+def wait_ready(pane: str, harness: str, timeout: float = 60.0) -> bool:
+    """Wait until the agent process is actually up in this pane.
 
     Polling for the PROCESS rather than for a banner string is harness-agnostic
-    and does not rot when a TUI redesigns its footer.
+    and does not rot when a TUI redesigns its footer. This is deliberately
+    pane-scoped: when spawning beside another agent, a session-level check could
+    mistake the existing agent for the one that is still starting.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if detect_harness(session) == harness:
+        if any(a["pane"] == pane and a["harness"] == harness for a in _scan()):
             return True
         time.sleep(0.4)
     return False
@@ -691,8 +695,8 @@ def pane_blocked(target: str) -> str:
 
 def spawn(harness: str, seed: str = "", name: str = "", model: str = "",
           yolo: bool = False, cwd: str = "", env: dict | None = None,
-          inherit_env: bool = True) -> dict:
-    """Start an agent in a new detached tmux session and optionally brief it.
+          inherit_env: bool | None = None, split_of: str = "") -> dict:
+    """Start an agent in a new session or split pane and optionally brief it.
 
     The seed prompt is pasted after the TUI is up rather than passed on the
     command line: some harnesses dispatch a CLI prompt before they have finished
@@ -700,12 +704,43 @@ def spawn(harness: str, seed: str = "", name: str = "", model: str = "",
     Pasting after boot sidesteps that for every harness at once.
     """
     entry = get_harness(harness)
-    session = name or f"{harness}-{os.urandom(3).hex()}"
-    if session in tmux_sessions():
-        raise WireError(f"tmux session {session!r} already exists")
+    # A split already inherits its target tmux session's environment. Copying
+    # the caller on top leaks orchestrator-specific state (CODEX_*, NO_COLOR,
+    # identity variables) into the child. A new detached session keeps the
+    # historical behavior because its tmux server environment may be stale.
+    if inherit_env is None:
+        inherit_env = not split_of
+    address = name or f"{harness}-{os.urandom(3).hex()}"
+    sessions = tmux_sessions()
+    if address in sessions or any(
+        address in (a["name"], a["session"]) for a in agents()
+    ):
+        raise WireError(f"agent address {address!r} already exists")
 
     cmd = build_command(harness, model=model, yolo=yolo)
-    tmux_cmd = ["tmux", "new-session", "-d", "-s", session]
+    if split_of:
+        try:
+            target = _run([
+                "tmux", "display-message", "-p", "-t", split_of,
+                "#{pane_id}:#{session_name}",
+            ]).stdout.strip()
+        except subprocess.CalledProcessError as e:
+            raise WireError(
+                f"no tmux pane matching {split_of!r}: {e.stderr.strip()}"
+            ) from None
+        pane_target, _, session = target.partition(":")
+        if not pane_target.startswith("%") or not session:
+            raise WireError(f"tmux returned an invalid pane for {split_of!r}")
+        tmux_cmd = [
+            "tmux", "split-window", "-d", "-t", pane_target,
+            "-P", "-F", "#{pane_id}",
+        ]
+    else:
+        session = address
+        tmux_cmd = [
+            "tmux", "new-session", "-d", "-s", session,
+            "-P", "-F", "#{pane_id}",
+        ]
     if cwd:
         tmux_cmd += ["-c", cwd]
     if _tmux_supports_session_env():
@@ -717,34 +752,27 @@ def spawn(harness: str, seed: str = "", name: str = "", model: str = "",
         )
     tmux_cmd.append(cmd)
     try:
-        _run(tmux_cmd)
+        pane = _run(tmux_cmd).stdout.strip()
     except subprocess.CalledProcessError as e:
-        raise WireError(f"could not start tmux session: {e.stderr.strip()}") from None
+        kind = "pane" if split_of else "session"
+        raise WireError(f"could not start tmux {kind}: {e.stderr.strip()}") from None
+    if not pane.startswith("%"):
+        raise WireError("tmux started the agent but did not report its pane id")
 
-    # Stamp the address onto the pane now, while the session is guaranteed to
-    # hold exactly one. Done here rather than after the agent boots so it also
-    # covers a seedless spawn, and so the address survives the session being
-    # renamed or a second agent being opened alongside this one later.
-    for pane_id, _pid, _wname, sess in _all_panes():
-        if sess == session:
-            set_wire_name(pane_id, session)
-            break
+    # Stamp the address immediately so it covers seedless spawns and remains
+    # stable when this session contains several agents.
+    set_wire_name(pane, address)
 
-    result = {"session": session, "harness": harness, "addr": session,
-              "label": entry["label"], "briefed": False}
+    result = {"session": session, "pane": pane, "harness": harness,
+              "addr": address, "label": entry["label"], "briefed": False}
     if not seed:
         return result
-    if not wait_ready(session, harness):
+    if not wait_ready(pane, harness):
         raise WireError(
-            f"session {session!r} started but no {harness} process appeared. "
-            f"`tmux attach -t {session}` to see what happened."
+            f"pane {pane} started but no {harness} process appeared. "
+            f"`tmux select-pane -t {pane}` to see what happened."
         )
     time.sleep(1.0)  # let the TUI paint before pasting into it
-    hit = find_agent(session)
-    if not hit:
-        raise WireError(f"session {session!r} lost its {harness} process while booting")
-    pane = hit[1]
-    result["pane"] = pane
     blocked = pane_blocked(pane)
     if blocked:
         result["blocked_on"] = blocked
@@ -791,10 +819,15 @@ def _cmd_spawn(args) -> int:
         extra[key] = value
     result = spawn(args.harness, seed=args.seed, name=args.name,
                    model=args.model, yolo=args.yolo, cwd=args.cwd, env=extra,
-                   inherit_env=not args.no_inherit_env)
+                   inherit_env=args.inherit_env,
+                   split_of=args.split_of)
     print(f"ADDR={result['addr']}")
     print(f"SESSION={result['session']}")
-    print(f"ATTACH=tmux attach -t {result['session']}")
+    print(f"PANE={result['pane']}")
+    if args.split_of:
+        print(f"SELECT=tmux select-pane -t {result['pane']}")
+    else:
+        print(f"ATTACH=tmux attach -t {result['session']}")
     if args.seed and not result["briefed"]:
         reason = result.get("blocked_on")
         if reason:
@@ -858,14 +891,26 @@ def build_parser() -> argparse.ArgumentParser:
     spw = sub.add_parser("spawn", help="start an agent and brief it")
     spw.add_argument("harness", choices=harness_names())
     spw.add_argument("seed", nargs="?", default="")
-    spw.add_argument("--name", default="", help="tmux session name")
+    spw.add_argument("--name", default="",
+                     help="agent address (also the tmux session name unless "
+                          "--split-of is used)")
     spw.add_argument("--model", default="")
     spw.add_argument("--cwd", default="", help="working directory")
+    spw.add_argument("--split-of", default="", metavar="PANE",
+                     help="split beside an existing tmux pane instead of "
+                          "creating a session")
     spw.add_argument("--env", action="append", default=[], metavar="KEY=VALUE",
                      help="add or override an environment variable (repeatable)")
-    spw.add_argument("--no-inherit-env", action="store_true",
-                     help="don't pass your environment (the tmux server's own "
-                          "environment still reaches the child)")
+    inheritance = spw.add_mutually_exclusive_group()
+    inheritance.add_argument(
+        "--inherit-env", dest="inherit_env", action="store_true",
+        help="pass your environment (default for a new session)",
+    )
+    inheritance.add_argument(
+        "--no-inherit-env", dest="inherit_env", action="store_false",
+        help="use the tmux environment only (default with --split-of)",
+    )
+    spw.set_defaults(inherit_env=None)
     spw.add_argument("--yolo", action="store_true",
                      help="skip the agent's own permission prompts")
     spw.set_defaults(func=_cmd_spawn)

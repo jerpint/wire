@@ -84,6 +84,9 @@ Prints the new agent's address. Useful flags:
 
 - `--name <session>` — choose the address instead of a generated one
 - `--cwd <dir>` — the directory it starts in
+- `--split-of <pane>` — split beside an existing tmux pane instead of creating
+  a detached session; splits use the target tmux environment by default
+- `--inherit-env` — copy the caller's environment into a split when intentional
 - `--model <model>` — a specific model
 - `--yolo` — skip the new agent's own permission prompts, so it can work unattended
 
